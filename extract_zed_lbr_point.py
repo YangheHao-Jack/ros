@@ -48,6 +48,9 @@ class Rosbag2ExtractorWithSegmentation:
         self.num_components = args.num_components
         self.pth            = args.pth
         self.alpha          = args.alpha
+        # number of point prompts
+        self.num_pos        = args.num_pos
+        self.num_neg        = args.num_neg
 
         # load coarse model (download if necessary)
         model_file = pathlib.Path.home() / args.model_path / args.model_name
@@ -96,16 +99,49 @@ class Rosbag2ExtractorWithSegmentation:
         return labels, topk
 
     def refine_with_sam2(self, img, labels, components):
+        """
+        Refine each selected component using SAM2 with random point prompts:
+         - self.num_pos points sampled inside that component (positive)
+         - self.num_neg points sampled outside ALL coarse components (negative)
+        """
         refined = np.zeros_like(labels, dtype=bool)
+        # preload the image once
+        self.sam_pred.set_image(img)
+        # precompute global coarse mask for negative sampling
+        coarse_mask = (labels > 0)
+        ys_out, xs_out = np.where(~coarse_mask)
+
         for comp in components:
             ys, xs = np.where(labels == comp)
-            x1, x2 = xs.min(), xs.max()
-            y1, y2 = ys.min(), ys.max()
-            box = np.array([[x1, y1, x2, y2]], dtype=np.int32)
+            if ys.size == 0:
+                continue
+            # sample positive points inside this component
+            replace_pos = len(xs) < self.num_pos
+            idxs_p = np.random.choice(len(xs), size=self.num_pos, replace=replace_pos)
+            pos_pts = np.stack([xs[idxs_p], ys[idxs_p]], axis=1)
+
+            # sample negative points outside all components
+            if ys_out.size > 0:
+                replace_neg = len(xs_out) < self.num_neg
+                idxs_n = np.random.choice(len(xs_out), size=self.num_neg, replace=replace_neg)
+                neg_pts = np.stack([xs_out[idxs_n], ys_out[idxs_n]], axis=1)
+                point_coords = np.vstack([pos_pts, neg_pts])
+                point_labels = np.concatenate([
+                    np.ones(len(pos_pts),  dtype=np.int32),
+                    np.zeros(len(neg_pts), dtype=np.int32),
+                ])
+            else:
+                point_coords = pos_pts
+                point_labels = np.ones(len(pos_pts), dtype=np.int32)
+
             with torch.amp.autocast(self.device):
-                self.sam_pred.set_image(img)
-                masks, _, _ = self.sam_pred.predict(box=box, multimask_output=False)
+                masks, _, _ = self.sam_pred.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=False
+                )
             refined |= masks[0].astype(bool)
+
         return refined
 
     def run(self):
@@ -153,17 +189,14 @@ class Rosbag2ExtractorWithSegmentation:
         left_seq  = 0
         right_seq = 0
 
-        # current joint state
         curr_joint_names = None
         curr_joint_positions = None
-
         last_world_base = np.eye(4, dtype=np.float64)
 
         while reader.has_next():
             topic, ser, _ts = reader.read_next()
             mtype = topic_type[topic]
 
-            # TF messages
             if mtype == 'tf2_msgs/msg/TFMessage':
                 tfm = deserialize_message(ser, TFMessage)
                 for tr in tfm.transforms:
@@ -174,68 +207,52 @@ class Rosbag2ExtractorWithSegmentation:
                         last_world_base = quaternion_to_homogeneous(
                             q.x, q.y, q.z, q.w, t.x, t.y, t.z)
 
-            # JointState messages
             elif mtype == 'sensor_msgs/msg/JointState':
                 js = deserialize_message(ser, JointState)
                 curr_joint_names = list(js.name)
                 curr_joint_positions = list(js.position)
 
-            # Image frames
             elif mtype == 'sensor_msgs/msg/CompressedImage':
                 msg = deserialize_message(ser, CompressedImage)
                 img = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
 
-                # determine side and sequence index
                 if 'left' in topic:
                     win, side, save_dir, idx = 'Left Camera', 'left', left_img_dir, left_seq
                 else:
                     win, side, save_dir, idx = 'Right Camera','right', right_img_dir, right_seq
 
-                # display & save raw image
                 cv2.imshow(win, img); cv2.waitKey(1)
-                img_name = f"{side}_{idx}.png"
-                cv2.imwrite(os.path.join(save_dir, img_name), img)
+                cv2.imwrite(os.path.join(save_dir, f"{side}_{idx}.png"), img)
 
-                # save world→base for left only
                 if side == 'left':
                     np.save(os.path.join(tf_out, f"tf_{idx}.npy"), last_world_base)
 
-                # segmentation pipeline
                 mask_coarse = self.inference_coarse(img)
                 labels, comps = self.keep_largest_components(mask_coarse)
                 mask_refined = self.refine_with_sam2(img, labels, comps)
 
-                # prepare mask & overlays
                 mask_u8  = (mask_refined.astype(np.uint8) * 255)
                 mask_reg = cv2.resize(mask_u8, (self.reg_w, self.reg_h), interpolation=cv2.INTER_NEAREST)
-
-                # save mask
                 cv2.imwrite(os.path.join(masks_dir, side, f"mask_{side}_{idx}.png"), mask_reg)
 
-                # overlay display & save
                 overlay = overlay_mask(img, mask_u8, 'r', alpha=self.alpha, beta=0.5)
                 win_overlay = 'Left Overlay' if side=='left' else 'Right Overlay'
                 cv2.imshow(win_overlay, overlay); cv2.waitKey(1)
                 cv2.imwrite(os.path.join(over_dir, side, f"overlay_{side}_{idx}.png"), overlay)
 
-                # save binary overlay
                 binary = (mask_refined.astype(np.uint8) * 255)
                 cv2.imwrite(os.path.join(binary_dir, side, f"binary_{side}_{idx}.png"), binary)
 
-                # save joint state for this frame
                 js_dir = js_left_dir if side=='left' else js_right_dir
-                # numpy
                 if curr_joint_positions is not None:
                     np.save(os.path.join(js_dir, f"joint_state_{side}_{idx}.npy"),
                             np.array(curr_joint_positions, dtype=np.float64))
-                    # csv
                     csv_path = os.path.join(js_dir, f"joint_state_{side}_{idx}.csv")
                     with open(csv_path, 'w', newline='') as f:
                         writer = csv.writer(f)
                         writer.writerow(curr_joint_names)
                         writer.writerow(curr_joint_positions)
 
-                # increment appropriate counter
                 if side == 'left':
                     left_seq  += 1
                 else:
@@ -265,6 +282,10 @@ def parse_args():
                    help='Threshold for coarse mask')
     p.add_argument('--alpha', type=float, default=0.3,
                    help='Alpha blending for overlay')
+    p.add_argument('--num-pos', type=int, default=30,
+                   help='Number of positive points inside each component')
+    p.add_argument('--num-neg', type=int, default=30,
+                   help='Number of negative points outside the coarse mask')
     p.add_argument('--device', choices=['cuda','cpu'], default='cuda')
     p.add_argument('--image-topics', nargs=2,
                    default=[

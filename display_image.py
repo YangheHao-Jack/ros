@@ -12,7 +12,7 @@ class CompressedImageSubscriber(Node):
         # Subscribe to the compressed image topic
         self.subscription = self.create_subscription(
             CompressedImage,
-            '/zed/zed_node/right/image_rect_color/compressed',  # Change to your topic name
+            '/zed/zed_node/left/image_rect_color/compressed',  # Change to your topic name
             self.listener_callback,
             10)
         self.subscription  # prevent unused variable warning
